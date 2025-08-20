@@ -2,12 +2,13 @@
 
 #====================================================================================
 #
-#          FILE: deploy_xray.sh
+#          FILE: xray1.0.sh
 # 
-#         USAGE: ./deploy_xray.sh
+#         USAGE: ./xray1.0.sh
 # 
 #   DESCRIPTION: 一个用于自动化部署 Xray (VLESS + TCP + XTLS-Vision) 的脚本。
-#                集成了证书申请、Nginx 伪装、Xray 部署及日志管理。
+#                集成了证书申请、Nginx 伪装、Xray 部署、BBR加速及日志管理。
+#                (已包含所有踩坑修复)
 # 
 #       OPTIONS: ---
 #  REQUIREMENTS: ---
@@ -16,7 +17,7 @@
 #        AUTHOR: acxcr & Manus AI
 #  ORGANIZATION: 
 #       CREATED: 2025年08月20日
-#      REVISION: 1.1
+#      REVISION: 1.2
 #
 #====================================================================================
 
@@ -31,9 +32,11 @@ NC='\033[0m' # No Color
 DOMAIN=""
 EMAIL=""
 UUID=""
-XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json" # 官方脚本默认路径
+XRAY_CONFIG_PATH="/opt/xray/config.json"
 CERT_DIR="/opt/xray/certs"
 LOG_DIR="/opt/xray/logs"
+NGINX_CONFIG_PATH="/opt/xray/nginx_redirect.conf"
+XRAY_USER="nobody" # Xray 默认运行用户
 
 # 函数：错误退出
 error_exit() {
@@ -145,13 +148,17 @@ manage_certificate() {
     ~/.acme.sh/acme.sh --install-cert -d ${DOMAIN} --ecc \
         --key-file       ${CERT_DIR}/private.key \
         --fullchain-file ${CERT_DIR}/fullchain.pem \
-        --reloadcmd      "systemctl reload xray 2>/dev/null; systemctl reload nginx 2>/dev/null"
+        --reloadcmd      "systemctl reload xray 2>/dev/null || true; systemctl reload nginx 2>/dev/null || true"
 
     if [ $? -eq 0 ]; then
         success "证书申请及安装全部完成！"
+        warning "首次安装时 'reload' 失败是正常现象，因为服务尚未安装。"
     else
         error_exit "证书安装失败。"
     fi
+    
+    info "【权限修复】正在将证书目录所有权赋予用户 ${XRAY_USER}..."
+    chown -R ${XRAY_USER}:${XRAY_USER} ${CERT_DIR} 2>/dev/null || chown -R ${XRAY_USER}:nogroup ${CERT_DIR}
 }
 
 # 选项2: 配置 Nginx
@@ -167,10 +174,10 @@ configure_nginx() {
         fi
     fi
     
-    info "正在生成 Nginx 配置文件..."
+    info "正在生成 Nginx 配置文件到 ${NGINX_CONFIG_PATH}..."
     info "伪装模式: 跳转到 https://www.jnto.go.jp/"
     
-    cat > /etc/nginx/sites-available/default <<EOF
+    cat > ${NGINX_CONFIG_PATH} <<EOF
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -179,12 +186,23 @@ server {
 }
 EOF
     
+    # 清理可能的冲突配置
+    rm -f /etc/nginx/sites-enabled/default
+    rm -f /etc/nginx/conf.d/default.conf
+    
+    info "正在创建软链接到 Nginx 配置目录..."
+    ln -sf ${NGINX_CONFIG_PATH} /etc/nginx/conf.d/
+    
     info "正在启动 Nginx 并设置为开机自启..."
-    if systemctl enable --now nginx; then
-        success "Nginx 伪装站点配置完成！"
-        info "您可以在完成所有步骤后 ，访问 https://<你的域名> 来验证跳转效果 。"
+    if nginx -t; then
+        if systemctl enable --now nginx; then
+            success "Nginx 伪装站点配置完成！"
+            info "您可以在完成所有步骤后 ，访问 https://<你的域名> 来验证跳转效果 。"
+        else
+            error_exit "Nginx 启动或启用失败。"
+        fi
     else
-        error_exit "Nginx 启动或启用失败。"
+        error_exit "Nginx 配置文件语法错误。"
     fi
 }
 
@@ -206,7 +224,7 @@ install_xray() {
     
     UUID_INPUT=$(prompt_input "请输入您的 VLESS UUID (留空将自动生成)")
     if [ -z "${UUID_INPUT}" ]; then
-        UUID=$(xray uuid)
+        UUID=$(/usr/local/bin/xray uuid)
         info "自动生成的 UUID 为: ${UUID}"
     else
         UUID=${UUID_INPUT}
@@ -284,6 +302,17 @@ install_xray() {
 }
 EOF
     
+    info "【配置修复】正在清理 Xray 服务的 Drop-In 覆盖配置..."
+    rm -rf /etc/systemd/system/xray.service.d
+    
+    info "【配置修复】正在修改 Xray 服务文件以指向 ${XRAY_CONFIG_PATH}..."
+    sed -i "s|/usr/local/etc/xray/config.json|${XRAY_CONFIG_PATH}|g" /etc/systemd/system/xray.service
+    
+    systemctl daemon-reload
+    
+    info "【权限修复】正在将工作目录所有权赋予用户 ${XRAY_USER}..."
+    chown -R ${XRAY_USER}:${XRAY_USER} /opt/xray 2>/dev/null || chown -R ${XRAY_USER}:nogroup /opt/xray
+    
     info "正在配置日志自动轮转 (logrotate)..."
     cat > /etc/logrotate.d/xray <<EOF
 ${LOG_DIR}/*.log {
@@ -293,7 +322,7 @@ ${LOG_DIR}/*.log {
     delaycompress
     missingok
     notifempty
-    create 0644 root root
+    create 0644 ${XRAY_USER} ${XRAY_USER}
     postrotate
         /bin/systemctl reload xray > /dev/null 2>/dev/null || true
     endscript
@@ -302,27 +331,59 @@ EOF
 
     info "正在启动 Xray 并设置为开机自启..."
     if systemctl enable --now xray; then
-        success "Xray 核心服务部署完成！"
-        echo "-------------------------------------------------"
-        echo -e "${YELLOW}[!] 您的配置信息如下，请妥善保管:${NC}"
-        echo "    地址 (Address): ${DOMAIN}"
-        echo "    端口 (Port): 443"
-        echo "    用户ID (UUID): ${UUID}"
-        echo "    加密 (Encryption): none"
-        echo "    传输协议 (Network): tcp"
-        echo "    流控 (Flow): xtls-rprx-vision"
-        echo "    安全 (Security): tls"
-        echo "    SNI: ${DOMAIN}"
-        echo "-------------------------------------------------"
-        echo -e "${GREEN}分享链接 (VLESS):${NC}"
-        echo "vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&flow=xtls-rprx-vision&type=tcp#Xray-Vision-by-${DOMAIN}"
-        echo "-------------------------------------------------"
+        sleep 2
+        if systemctl is-active --quiet xray; then
+            success "Xray 核心服务部署完成并成功运行！"
+            echo "-------------------------------------------------"
+            echo -e "${YELLOW}[!] 您的配置信息如下，请妥善保管:${NC}"
+            echo "    地址 (Address): ${DOMAIN}"
+            echo "    端口 (Port): 443"
+            echo "    用户ID (UUID): ${UUID}"
+            echo "    加密 (Encryption): none"
+            echo "    传输协议 (Network): tcp"
+            echo "    流控 (Flow): xtls-rprx-vision"
+            echo "    安全 (Security): tls"
+            echo "    SNI: ${DOMAIN}"
+            echo "-------------------------------------------------"
+            echo -e "${GREEN}分享链接 (VLESS):${NC}"
+            echo "vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&flow=xtls-rprx-vision&type=tcp#${DOMAIN}-by-acxcr"
+            echo "-------------------------------------------------"
+        else
+            error_exit "Xray 启动失败。请运行 'journalctl -u xray' 查看详细日志。"
+        fi
     else
-        error_exit "Xray 启动或启用失败。请运行 'journalctl -u xray' 查看日志。"
+        error_exit "Xray 启用失败。"
     fi
 }
 
-# 选项4: 卸载
+# 选项4: 开启 BBR
+enable_bbr() {
+    info "开始执行: 【BBR 加速】..."
+    
+    if grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf && grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+        success "BBR 已启用，无需重复配置。"
+        return
+    fi
+    
+    cat >> /etc/sysctl.conf <<EOF
+
+# Enable BBR Congestion Control
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    
+    sysctl -p
+    
+    # 验证
+    local bbr_status=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+    if [ "$bbr_status" == "bbr" ]; then
+        success "Google BBR 已成功开启！"
+    else
+        error_exit "BBR 开启失败，请检查内核版本是否高于 4.9。"
+    fi
+}
+
+# 选项5: 卸载
 uninstall() {
     warning "此操作将彻底删除 Xray, Nginx, Acme.sh 及其所有配置文件！"
     warning "数据将无法恢复，请谨慎操作！"
@@ -362,26 +423,28 @@ main_menu() {
     echo "=      Xray 自动化部署脚本 (VLESS + Vision)      ="
     echo "=                 by acxcr                       ="
     echo "================================================"
-    echo -e "[当前时间: $(date '+%Y-%m-%d %H:%M:%S')]"
+    echo -e "[当前时间: $(date '+%Y-%m-%d %H:%M:%S')] (v1.2)"
     echo ""
     echo "请选择要执行的操作:"
     echo ""
     echo "1. 【证书管理】安装 Acme.sh 并申请/续签证书"
     echo "2. 【伪装站点】安装 Nginx 并配置跳转"
     echo "3. 【核心服务】安装 Xray 并配置 VLESS + Vision"
-    echo "4. 【一键卸载】清理本机部署环境"
-    echo "5. 【退出脚本】"
+    echo "4. 【系统优化】一键开启 Google BBR 加速"
+    echo "5. 【一键卸载】清理本机部署环境"
+    echo "6. 【退出脚本】"
     echo ""
     echo "-------------------------------------------------"
     
-    read -p "请输入选项 [1-5]: " option
+    read -p "请输入选项 [1-6]: " option
     case $option in
         1) manage_certificate; press_any_key ;;
         2) configure_nginx; press_any_key ;;
         3) install_xray; press_any_key ;;
-        4) uninstall; press_any_key ;;
-        5) exit 0 ;;
-        *) echo -e "${RED}无效选项，请输入 1-5 之间的数字。${NC}"; sleep 2 ;;
+        4) enable_bbr; press_any_key ;;
+        5) uninstall; press_any_key ;;
+        6) exit 0 ;;
+        *) echo -e "${RED}无效选项，请输入 1-6 之间的数字。${NC}"; sleep 2 ;;
     esac
 }
 
